@@ -11,9 +11,13 @@ class Capabilities implements ICapability {
         return [
             'crispcloud_delta' => [
                 'enabled' => true,
-                'version' => '0.1.0',
+                'version' => '0.3.0',
+                'supportedAlgorithms' => ['fastcdc', 'fixed'],
+                'defaultAlgorithm' => 'fastcdc',
                 'blockSize' => 4 * 1024 * 1024,
-                'algorithm' => 'adler32+sha256',
+                'minChunkSize' => Service\FastCdc::DEFAULT_MIN_SIZE,
+                'avgChunkSize' => Service\FastCdc::DEFAULT_AVG_SIZE,
+                'maxChunkSize' => Service\FastCdc::DEFAULT_MAX_SIZE,
             ],
         ];
     }
