@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: 2026 CrispCloud Contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: PHP Lint
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  lint:
+    name: PHP syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Lint PHP files
+        run: |
+          set -e
+          # Match PHP 7.4 (project minimum) for broadest compatibility
+          docker run --rm -v "$PWD:/app" -w /app php:7.4-cli \
+            sh -c 'find server -type f -name "*.php" -print0 | xargs -0 -n1 php -l'
