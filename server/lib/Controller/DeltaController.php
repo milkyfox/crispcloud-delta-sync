@@ -351,7 +351,7 @@ class DeltaController extends Controller {
     public function status(): JSONResponse {
         return new JSONResponse([
             'app' => 'crispcloud_delta',
-            'version' => '0.3.0',
+            'version' => '0.3.1',
             'status' => 'ok',
             'blockSize' => 4 * 1024 * 1024,
             'algorithm' => 'adler32+sha256',

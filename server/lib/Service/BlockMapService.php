@@ -324,10 +324,11 @@ class BlockMapService {
                         throw new \RuntimeException("Cannot create temp file for finalize");
                     }
 
+                    $derivedSignatures = null;
                     try {
                         if (!empty($recipe)) {
                             // === CDC Recipe-Based Streaming Assembly ===
-                            $this->assembleWithRecipe($userId, $file, $path, $recipe, $tempFile);
+                            $derivedSignatures = $this->assembleWithRecipe($userId, $file, $path, $recipe, $tempFile);
                             $recomputeAlgo = 'fastcdc';
                         } else {
                             // === Legacy Offset-Based Patching ===
@@ -376,10 +377,35 @@ class BlockMapService {
                         $finalSize = $file->getSize();
                     }
 
-                    // Recompute and cache new blockmap in AppData using post-touch node & ETag
-                    $freshMap = ($recomputeAlgo === 'fastcdc')
-                        ? $this->computeFastCdcMap($reloadedFile, $path)
-                        : $this->computeFixedBlockMap($reloadedFile, $path);
+                    // Build and cache the new blockmap in AppData using post-touch node & ETag.
+                    // Preferred: derive it from the assembly recipe (no rescan — every chunk's
+                    // hash/size/offset is known during assembly). Fall back to a full scan when
+                    // no recipe is available or the derived data is inconsistent.
+                    $freshMap = null;
+                    if ($recomputeAlgo === 'fastcdc' && is_array($derivedSignatures)) {
+                        $derivedTotal = 0;
+                        foreach ($derivedSignatures as $derivedSig) {
+                            $derivedTotal += (int)$derivedSig['size'];
+                        }
+                        if ($derivedTotal === (int)$finalSize) {
+                            $freshMap = [
+                                'filePath' => $path,
+                                'totalSize' => (int)$finalSize,
+                                'algorithm' => 'fastcdc',
+                                'minSize' => FastCdc::DEFAULT_MIN_SIZE,
+                                'avgSize' => FastCdc::DEFAULT_AVG_SIZE,
+                                'maxSize' => FastCdc::DEFAULT_MAX_SIZE,
+                                'blockCount' => count($derivedSignatures),
+                                'signatures' => $derivedSignatures,
+                                'createdAt' => (new \DateTimeImmutable())->format(\DateTimeInterface::ATOM),
+                            ];
+                        }
+                    }
+                    if ($freshMap === null) {
+                        $freshMap = ($recomputeAlgo === 'fastcdc')
+                            ? $this->computeFastCdcMap($reloadedFile, $path)
+                            : $this->computeFixedBlockMap($reloadedFile, $path);
+                    }
                     $freshMap['etag'] = $finalEtag;
                     $this->saveCachedBlockMap($userId, $path, $recomputeAlgo, $freshMap);
 
@@ -406,11 +432,16 @@ class BlockMapService {
     /**
      * Assemble file using CDC Recipe (streaming, zero full-file RAM buffering).
      *
+     * Returns the block map signatures for the assembled file, derived directly
+     * from the recipe (every chunk's hash/size/offset is known during assembly),
+     * so the caller can cache the new block map without a full re-scan.
+     *
      * @param array $recipe Ordered list of chunk hashes; each item is either a
      *                      string hash or ['hash' => ...]
      * @param resource $tempFile Open temp output stream
+     * @return array<int, array{chunkIndex: int, offset: int, size: int, hash: string, strongHash: string}>
      */
-    private function assembleWithRecipe(string $userId, \OCP\Files\File $file, string $path, array $recipe, $tempFile): void {
+    private function assembleWithRecipe(string $userId, \OCP\Files\File $file, string $path, array $recipe, $tempFile): array {
         $stageFolder = null;
         try {
             $stageFolder = $this->getStageFolder($userId, $path);
@@ -435,6 +466,10 @@ class BlockMapService {
         $tempSeekableFile = null;
         $tempSeekablePath = null;
         $srcStream = false;
+
+        $derivedSignatures = [];
+        $derivedOffset = 0;
+        $chunkIndex = 0;
 
         if (is_resource($rawSrcStream)) {
             $meta = stream_get_meta_data($rawSrcStream);
@@ -479,6 +514,7 @@ class BlockMapService {
                             fclose($stagedStream);
                         }
                     }
+                    $chunkSize = (int)$copied;
                 } elseif ($source === 'existing' && isset($item['offset']) && isset($item['size']) && $srcStream !== false) {
                     // Explicit existing offset/size
                     fseek($srcStream, (int)$item['offset'], SEEK_SET);
@@ -486,6 +522,7 @@ class BlockMapService {
                     if ($copied === false || $copied !== (int)$item['size']) {
                         throw new \RuntimeException("Failed to copy existing chunk from source file at offset {$item['offset']}");
                     }
+                    $chunkSize = (int)$item['size'];
                 } elseif (isset($existingChunksByHash[$hash]) && $srcStream !== false) {
                     // Matched from existing chunk hash
                     $sig = $existingChunksByHash[$hash];
@@ -494,9 +531,20 @@ class BlockMapService {
                     if ($copied === false || $copied !== (int)$sig['size']) {
                         throw new \RuntimeException("Failed to copy existing chunk [$hash] from source file");
                     }
+                    $chunkSize = (int)$sig['size'];
                 } else {
                     throw new \RuntimeException("Recipe chunk [$hash] not found in staged or existing file");
                 }
+
+                $normalizedHash = strtolower((string)$hash);
+                $derivedSignatures[] = [
+                    'chunkIndex' => $chunkIndex++,
+                    'offset' => $derivedOffset,
+                    'size' => $chunkSize,
+                    'hash' => $normalizedHash,
+                    'strongHash' => $normalizedHash,
+                ];
+                $derivedOffset += $chunkSize;
             }
         } finally {
             if (is_resource($rawSrcStream)) {
@@ -509,6 +557,8 @@ class BlockMapService {
                 @unlink($tempSeekablePath);
             }
         }
+
+        return $derivedSignatures;
     }
 
     private function nodeExists($folder, string $name): bool {

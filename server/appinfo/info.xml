@@ -28,7 +28,7 @@ files, disk images, VM snapshots, PST archives.
 - ownCloud 10.11+ (uses shared OCP\Files and OCP\AppFramework APIs)
 - ownCloud Infinite Scale (oCIS): use the Go sidecar in ocis/ instead
     ]]></description>
-    <version>0.3.0</version>
+    <version>0.3.1</version>
     <licence>agpl</licence>
     <author>CrispCloud Contributors</author>
     <namespace>CrispCloudDelta</namespace>
