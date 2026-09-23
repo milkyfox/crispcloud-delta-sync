@@ -8,6 +8,7 @@ use OCP\Files\AppData\IAppDataFactory;
 use OCP\Files\IAppData;
 use OCP\Files\IRootFolder;
 use OCP\Files\NotFoundException;
+use OCP\ICacheFactory;
 use OCP\IConfig;
 use OCP\Lock\ILockingProvider;
 use OCP\Lock\LockedException;
@@ -23,22 +24,38 @@ class BlockMapService {
     private const FINALIZE_LOCK_RETRIES = 200;
     private const FINALIZE_LOCK_RETRY_US = 100000;
 
+    /**
+     * TTL of the app-level delta lock when a distributed cache is available.
+     * Deliberately short: a worker killed mid-finalize must not keep a file
+     * blocked for the instance-wide filelocking.ttl (1h by default).
+     */
+    private const LOCK_TTL_SECONDS = 120;
+    /** How often a long-running assembly refreshes its delta lock. */
+    private const LOCK_REFRESH_INTERVAL_SECONDS = 45;
+    /** Staged chunks older than this are treated as abandoned and swept. */
+    private const STAGING_STALE_AFTER_SECONDS = 86400;
+
     private IRootFolder $rootFolder;
     private IConfig $config;
     private ?IAppDataFactory $appDataFactory;
     private ?IAppData $appData = null;
     private ?ILockingProvider $lockingProvider = null;
+    private ?ICacheFactory $cacheFactory;
+    /** @var array{cache: \OCP\ICache, key: string, owner: string, refreshedAt: int}|null */
+    private ?array $activeCacheLock = null;
 
     public function __construct(
         IRootFolder $rootFolder,
         IConfig $config,
         ?IAppDataFactory $appDataFactory = null,
-        ?ILockingProvider $lockingProvider = null
+        ?ILockingProvider $lockingProvider = null,
+        ?ICacheFactory $cacheFactory = null
     ) {
         $this->rootFolder = $rootFolder;
         $this->config = $config;
         $this->appDataFactory = $appDataFactory;
         $this->lockingProvider = $lockingProvider;
+        $this->cacheFactory = $cacheFactory;
     }
 
     private function getAppDataFolder(): \OCP\Files\Folder {
@@ -93,6 +110,11 @@ class BlockMapService {
      * @param string $algo 'fixed' (default) or 'fastcdc'
      */
     public function getBlockMap(string $userId, string $path, string $algo = 'fixed'): ?array {
+        // Opportunistic sweep of abandoned staging folders. Running it here (once
+        // per block-map request) means crashed delta sessions are reclaimed without
+        // relying on a cron job or on a probabilistic trigger.
+        $this->cleanStaleStagingFolders();
+
         $userFolder = $this->getUserFolder($userId);
 
         try {
@@ -286,9 +308,8 @@ class BlockMapService {
             }
             error_log("crispcloud_delta: staged chunk [$name] (" . strlen($data) . " bytes) for $path in AppData");
 
-            if (random_int(1, 50) === 1) {
-                $this->cleanStaleStagingFolders();
-            }
+            // Abandoned staging folders are swept deterministically by getBlockMap()
+            // and finalizeFile(); no probabilistic trigger is needed on this hot path.
         });
     }
 
@@ -310,6 +331,9 @@ class BlockMapService {
         ?string $ifMatch = null,
         ?int $mtime = null
     ): array {
+        // Reclaim staging folders left behind by crashed finalizes (see getBlockMap()).
+        $this->cleanStaleStagingFolders();
+
         $fileInfoResult = [];
         for ($attempt = 0; ; $attempt++) {
             try {
@@ -343,9 +367,15 @@ class BlockMapService {
                             }
                         }
 
-                        // Stream assembled content into Nextcloud file node
+                        // Commit the assembled content atomically: write it into a sibling
+                        // ".part" file and rename that over the target. Nextcloud's
+                        // View::rename() treats a ".part" -> regular-file rename as a write
+                        // (cache update, write hooks, versioning, file id preserved) and the
+                        // underlying storage rename is atomic, so readers observe either the
+                        // complete old file or the complete new file. A worker killed at any
+                        // point can no longer leave the target truncated.
                         fseek($tempFile, 0, SEEK_SET);
-                        $file->putContent($tempFile);
+                        $this->replaceFileAtomically($userId, $path, $file, $tempFile);
                     } finally {
                         if (is_resource($tempFile)) {
                             fclose($tempFile);
@@ -353,6 +383,9 @@ class BlockMapService {
                         @unlink($tempFilePath);
                     }
 
+                    // Re-resolve the node: the atomic replace swapped the content behind
+                    // the path, so touch the fresh node to apply the client's mtime.
+                    $file = $userFolder->get($path);
                     if ($mtime !== null && $mtime > 0) {
                         $file->touch($mtime);
                     } else {
@@ -491,6 +524,9 @@ class BlockMapService {
 
         try {
             foreach ($recipe as $item) {
+                // Keep the delta lock alive across long assemblies.
+                $this->refreshPathLock();
+
                 $hash = is_array($item) ? ($item['hash'] ?? '') : (string)$item;
                 $source = is_array($item) ? ($item['source'] ?? '') : '';
 
@@ -606,6 +642,9 @@ class BlockMapService {
 
         $assembledLength = $sourceLength;
         foreach ($nodesByOffset as $offset => $node) {
+            // Keep the delta lock alive across long assemblies.
+            $this->refreshPathLock();
+
             $stagedStream = $node->fopen('rb');
             if ($stagedStream === false) {
                 throw new \RuntimeException("Cannot open staged block stream for offset $offset of $path");
@@ -679,22 +718,27 @@ class BlockMapService {
             $stagingRoot = $this->getOrCreateFolder($appData, 'staging');
             $now = time();
             foreach ($stagingRoot->getDirectoryListing() as $userStaging) {
-                if ($userStaging->getType() === \OCP\Files\FileInfo::TYPE_FOLDER) {
-                    foreach ($userStaging->getDirectoryListing() as $fileStaging) {
-                        if ($fileStaging->getType() === \OCP\Files\FileInfo::TYPE_FOLDER) {
-                            if ($now - $fileStaging->getMTime() > 86400) {
-                                try {
-                                    $fileStaging->delete();
-                                    error_log("crispcloud_delta: cleaned up stale staging folder " . $fileStaging->getName());
-                                } catch (\Throwable $e) {}
-                            }
-                        }
+                if ($userStaging->getType() !== \OCP\Files\FileInfo::TYPE_FOLDER) {
+                    continue;
+                }
+                foreach ($userStaging->getDirectoryListing() as $fileStaging) {
+                    if ($fileStaging->getType() !== \OCP\Files\FileInfo::TYPE_FOLDER) {
+                        continue;
                     }
-                    if (empty($userStaging->getDirectoryListing())) {
+                    if ($now - $fileStaging->getMTime() > self::STAGING_STALE_AFTER_SECONDS) {
                         try {
-                            $userStaging->delete();
+                            $fileStaging->delete();
+                            error_log("crispcloud_delta: cleaned up stale staging folder " . $fileStaging->getName());
                         } catch (\Throwable $e) {}
                     }
+                }
+                // Drop empty per-user folders only once they are stale too: a freshly
+                // created folder may belong to an upload that is just starting.
+                if ($now - $userStaging->getMTime() > self::STAGING_STALE_AFTER_SECONDS
+                    && empty($userStaging->getDirectoryListing())) {
+                    try {
+                        $userStaging->delete();
+                    } catch (\Throwable $e) {}
                 }
             }
         } catch (\Throwable $e) {}
@@ -734,8 +778,41 @@ class BlockMapService {
     }
 
     private function withPathLock(string $userId, string $path, callable $operation): void {
+        $lockKey = 'crispcloud_delta_' . hash('sha256', $userId . ':' . $path);
+
+        // Preferred: a short-TTL distributed lock. Unlike ILockingProvider (whose TTL
+        // is the instance-wide filelocking.ttl, 1h by default) a killed worker only
+        // blocks this path until the key expires, i.e. LOCK_TTL_SECONDS.
+        $lockCache = $this->getDistributedLockCache();
+        if ($lockCache !== null) {
+            $owner = bin2hex(random_bytes(16));
+            $acquired = false;
+            for ($attempt = 0; $attempt < 50; $attempt++) {
+                if ($lockCache->add($lockKey, $owner, self::LOCK_TTL_SECONDS)) {
+                    $acquired = true;
+                    break;
+                }
+                usleep(100000);
+            }
+            if (!$acquired) {
+                throw new \RuntimeException("Cannot lock delta path: $path");
+            }
+
+            $this->activeCacheLock = [
+                'cache' => $lockCache,
+                'key' => $lockKey,
+                'owner' => $owner,
+                'refreshedAt' => time(),
+            ];
+            try {
+                $operation();
+            } finally {
+                $this->releaseCacheLock();
+            }
+            return;
+        }
+
         if ($this->lockingProvider !== null) {
-            $lockKey = 'crispcloud_delta_' . hash('sha256', $userId . ':' . $path);
             $acquired = false;
             for ($attempt = 0; $attempt < 50; $attempt++) {
                 try {
@@ -774,6 +851,158 @@ class BlockMapService {
                 flock($lock, LOCK_UN);
                 fclose($lock);
             }
+        }
+    }
+
+    /**
+     * Distributed cache to use for the app-level delta lock, or null when this
+     * instance has no distributed cache configured (a local cache cannot serialise
+     * across PHP workers, so callers must fall back to ILockingProvider).
+     */
+    private function getDistributedLockCache(): ?\OCP\ICache {
+        if ($this->cacheFactory === null) {
+            return null;
+        }
+        $distributed = (string)$this->config->getSystemValue('memcache.distributed', '');
+        if ($distributed === '') {
+            return null;
+        }
+        try {
+            return $this->cacheFactory->createDistributed('crispcloud_delta/locks');
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    /**
+     * Keep the app-level delta lock alive during long assemblies. Throttled to one
+     * cache write per LOCK_REFRESH_INTERVAL_SECONDS, so it is safe to call from
+     * per-chunk loops.
+     */
+    private function refreshPathLock(): void {
+        if ($this->activeCacheLock === null) {
+            return;
+        }
+        $now = time();
+        if ($now - $this->activeCacheLock['refreshedAt'] < self::LOCK_REFRESH_INTERVAL_SECONDS) {
+            return;
+        }
+        $this->activeCacheLock['refreshedAt'] = $now;
+        try {
+            $cache = $this->activeCacheLock['cache'];
+            if ($cache->get($this->activeCacheLock['key']) === $this->activeCacheLock['owner']) {
+                $cache->set($this->activeCacheLock['key'], $this->activeCacheLock['owner'], self::LOCK_TTL_SECONDS);
+            }
+        } catch (\Throwable $e) {}
+    }
+
+    /** Release the app-level delta lock if this process still owns it. */
+    private function releaseCacheLock(): void {
+        if ($this->activeCacheLock === null) {
+            return;
+        }
+        $lock = $this->activeCacheLock;
+        $this->activeCacheLock = null;
+        try {
+            if ($lock['cache']->get($lock['key']) === $lock['owner']) {
+                $lock['cache']->remove($lock['key']);
+            }
+        } catch (\Throwable $e) {}
+    }
+
+    /**
+     * Delete abandoned "<target>.<16 hex>.part" siblings of the file being finalized.
+     *
+     * An aborted finalize leaves its part file behind, and those files are invisible
+     * to clients but still occupy disk, so each finalize reclaims its own leftovers.
+     * Part files have no filecache entry by design, hence the raw storage directory is
+     * inspected. Only files matching the exact part-file pattern of this target are
+     * removed, and the caller holds the per-path delta lock, so a part file of an
+     * in-flight finalize can never be hit.
+     */
+    private function cleanAbandonedPartFiles(\OCP\Files\File $file): void {
+        try {
+            $storage = $file->getStorage();
+            $internalPath = $file->getInternalPath();
+            $internalDir = dirname($internalPath);
+            if ($internalDir === '.' || $internalDir === '/') {
+                $internalDir = '';
+            }
+
+            $prefix = $file->getName() . '.';
+            $prefixLen = strlen($prefix);
+
+            $handle = $storage->opendir($internalDir === '' ? '/' : $internalDir);
+            if (!is_resource($handle)) {
+                return;
+            }
+            try {
+                while (($entry = readdir($handle)) !== false) {
+                    if (strpos($entry, $prefix) !== 0 || substr($entry, -5) !== '.part') {
+                        continue;
+                    }
+                    $mid = substr($entry, $prefixLen, -5);
+                    if (strlen($mid) !== 16 || !ctype_xdigit($mid)) {
+                        continue;
+                    }
+                    $storage->unlink(($internalDir !== '' ? $internalDir . '/' : '') . $entry);
+                    error_log('crispcloud_delta: removed abandoned part file ' . $entry);
+                }
+            } finally {
+                closedir($handle);
+            }
+        } catch (\Throwable $e) {}
+    }
+
+    /**
+     * Atomically replace the content of the file at $path with $sourceStream.
+     *
+     * Mirrors what Nextcloud's own WebDAV PUT does for ordinary uploads: stream the
+     * bytes into a sibling "<name>.<random>.part" file, then rename that over the
+     * target. View::rename() detects the partial-file source and performs a *write*
+     * update (new size/etag, target file id kept), and the underlying storage rename
+     * is atomic. A worker killed at any point therefore leaves the target holding its
+     * previous complete content - never a half-written file.
+     *
+     * The View layer is used on purpose: a ".part" file has no filecache entry by
+     * design, so the Node/File API refuses to write it ("update permission") and
+     * View::shouldEmitHooks() short-circuits partial files so no app hooks fire.
+     *
+     * @param \OCP\Files\File $file Target file node
+     * @param resource $sourceStream Rewound stream holding the new content
+     */
+    private function replaceFileAtomically(string $userId, string $path, \OCP\Files\File $file, $sourceStream): void {
+        if (!class_exists('\OC\Files\View')) {
+            // Legacy/unknown platform: keep the previous in-place write rather than
+            // break finalize outright.
+            error_log('crispcloud_delta: filesystem View unavailable; finalize is not atomic for ' . $path);
+            if (is_resource($sourceStream)) {
+                fseek($sourceStream, 0, SEEK_SET);
+            }
+            $file->putContent($sourceStream);
+            return;
+        }
+
+        $view = new \OC\Files\View('/' . $userId . '/files');
+        $relPath = ltrim($path, '/');
+        $relDir = dirname($relPath);
+        if ($relDir === '.' || $relDir === '/') {
+            $relDir = '';
+        }
+        $relPart = ($relDir !== '' ? $relDir . '/' : '')
+            . $file->getName() . '.' . bin2hex(random_bytes(8)) . '.part';
+
+        $this->cleanAbandonedPartFiles($file);
+
+        if ($view->file_put_contents($relPart, $sourceStream) === false) {
+            throw new \RuntimeException("Cannot write part file for $path");
+        }
+
+        if (!$view->rename($relPart, $relPath)) {
+            try {
+                $view->unlink($relPart);
+            } catch (\Throwable $e) {}
+            throw new \RuntimeException("Cannot atomically replace $path");
         }
     }
 
