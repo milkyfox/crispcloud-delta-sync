@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace OCA\CrispCloudDelta\Service;
 
+use OCP\EventDispatcher\IEventDispatcher;
 use OCP\Files\AppData\IAppDataFactory;
+use OCP\Files\Events\Node\BeforeNodeWrittenEvent;
+use OCP\Files\Events\Node\NodeWrittenEvent;
 use OCP\Files\IAppData;
 use OCP\Files\IRootFolder;
 use OCP\Files\NotFoundException;
@@ -41,6 +44,7 @@ class BlockMapService {
     private ?IAppData $appData = null;
     private ?ILockingProvider $lockingProvider = null;
     private ?ICacheFactory $cacheFactory;
+    private ?IEventDispatcher $eventDispatcher;
     /** @var array{cache: \OCP\ICache, key: string, owner: string, refreshedAt: int}|null */
     private ?array $activeCacheLock = null;
 
@@ -49,13 +53,15 @@ class BlockMapService {
         IConfig $config,
         ?IAppDataFactory $appDataFactory = null,
         ?ILockingProvider $lockingProvider = null,
-        ?ICacheFactory $cacheFactory = null
+        ?ICacheFactory $cacheFactory = null,
+        ?IEventDispatcher $eventDispatcher = null
     ) {
         $this->rootFolder = $rootFolder;
         $this->config = $config;
         $this->appDataFactory = $appDataFactory;
         $this->lockingProvider = $lockingProvider;
         $this->cacheFactory = $cacheFactory;
+        $this->eventDispatcher = $eventDispatcher;
     }
 
     private function getAppDataFolder(): \OCP\Files\Folder {
@@ -971,6 +977,29 @@ class BlockMapService {
      * @param \OCP\Files\File $file Target file node
      * @param resource $sourceStream Rewound stream holding the new content
      */
+    /**
+     * Dispatch the typed node events that Nextcloud's own WebDAV uploads emit.
+     *
+     * The atomic replace writes a partial (".part") file and renames it over the
+     * target. View::shouldEmitHooks() short-circuits partial files, so neither the
+     * part-file write nor the rename triggers the write hooks that HookConnector
+     * turns into Before/NodeWrittenEvent. Without these events files_versions would
+     * never snapshot the previous content (and activity/author tracking would miss
+     * the change), so dispatch them explicitly - exactly like the DAV layer does.
+     */
+    private function dispatchNodeWrittenEvents(\OCP\Files\File $file, bool $before): void {
+        if ($this->eventDispatcher === null) {
+            return;
+        }
+        try {
+            $this->eventDispatcher->dispatchTyped($before
+                ? new BeforeNodeWrittenEvent($file)
+                : new NodeWrittenEvent($file));
+        } catch (\Throwable $e) {
+            error_log('crispcloud_delta: node write event dispatch failed: ' . $e->getMessage());
+        }
+    }
+
     private function replaceFileAtomically(string $userId, string $path, \OCP\Files\File $file, $sourceStream): void {
         if (!class_exists('\OC\Files\View')) {
             // Legacy/unknown platform: keep the previous in-place write rather than
@@ -994,6 +1023,9 @@ class BlockMapService {
 
         $this->cleanAbandonedPartFiles($file);
 
+        // Let files_versions/activity see the write before the old content disappears.
+        $this->dispatchNodeWrittenEvents($file, true);
+
         if ($view->file_put_contents($relPart, $sourceStream) === false) {
             throw new \RuntimeException("Cannot write part file for $path");
         }
@@ -1004,6 +1036,8 @@ class BlockMapService {
             } catch (\Throwable $e) {}
             throw new \RuntimeException("Cannot atomically replace $path");
         }
+
+        $this->dispatchNodeWrittenEvents($file, false);
     }
 
     private function loadCachedBlockMap(string $userId, string $path, string $algo = 'fixed'): ?array {
