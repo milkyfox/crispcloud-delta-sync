@@ -24,8 +24,20 @@ use OCP\Lock\LockedException;
 class BlockMapService {
     private const BLOCK_SIZE = 4 * 1024 * 1024; // 4 MB for fixed mode
     private const ADLER_MOD = 65521;
-    private const FINALIZE_LOCK_RETRIES = 200;
-    private const FINALIZE_LOCK_RETRY_US = 100000;
+    /**
+     * Whole-operation retries for lock errors that are not raised by the final
+     * rename. Assembly itself takes no filesystem locks (see openReadStream()), so
+     * this is only a safety net; renamePartWithRetry() waits out a busy target.
+     */
+    private const FINALIZE_LOCK_RETRIES = 3;
+    private const FINALIZE_LOCK_RETRY_US = 200000;
+    /**
+     * How often the atomic rename of a finished assembly is re-attempted while the
+     * target is locked. The part file is already complete at that point, so
+     * retrying is cheap and never repeats the assembly.
+     */
+    private const COMMIT_LOCK_RETRIES = 60;
+    private const COMMIT_LOCK_RETRY_US = 250000;
 
     /**
      * TTL of the app-level delta lock when a distributed cache is available.
@@ -163,7 +175,7 @@ class BlockMapService {
      */
     private function computeFastCdcMap(\OCP\Files\File $file, string $path): array {
         $size = $file->getSize();
-        $handle = $file->fopen('rb');
+        $handle = $this->openReadStream($file);
         if ($handle === false) {
             throw new \RuntimeException("Cannot open file: $path");
         }
@@ -209,7 +221,7 @@ class BlockMapService {
         $blockCount = $size === 0 ? 0 : (int)ceil($size / $blockSize);
         $signatures = [];
 
-        $handle = $file->fopen('rb');
+        $handle = $this->openReadStream($file);
         if ($handle === false) {
             throw new \RuntimeException("Cannot open file: $path");
         }
@@ -348,11 +360,14 @@ class BlockMapService {
                     $userFolder = $this->getUserFolder($userId);
                     $file = $this->getOrCreateFile($userFolder, $path);
 
-                    $tempFilePath = tempnam(sys_get_temp_dir(), 'nc_delta_');
-                    $tempFile = fopen($tempFilePath, 'w+b');
-                    if ($tempFile === false) {
-                        throw new \RuntimeException("Cannot create temp file for finalize");
-                    }
+                    // Assemble directly into a sibling ".part" file inside the target's own
+                    // folder (see openAssemblyTarget()). This keeps plaintext assembly data
+                    // out of the system temp directory, avoids one full extra copy of the
+                    // file, and turns crash leftovers into partial files that are encrypted
+                    // under server-side encryption and invisible to clients.
+                    $assembly = $this->openAssemblyTarget($userId, $path, $file, !empty($recipe));
+                    $tempFilePath = $assembly['fallbackTempPath'];
+                    $tempFile = $assembly['stream'];
 
                     $derivedSignatures = null;
                     try {
@@ -360,16 +375,32 @@ class BlockMapService {
                             // === CDC Recipe-Based Streaming Assembly ===
                             $derivedSignatures = $this->assembleWithRecipe($userId, $file, $path, $recipe, $tempFile);
                             $recomputeAlgo = 'fastcdc';
-                        } else {
-                            // === Legacy Offset-Based Patching ===
-                            $this->assembleWithOffsetBlocks($userId, $file, $path, $newSize, $tempFile);
-                            $recomputeAlgo = 'fixed';
-                        }
+                            } else {
+                                // === Legacy Offset-Based Patching ===
+                                $derivedSignatures = $this->assembleWithOffsetBlocks($userId, $file, $path, $newSize, $tempFile);
+                                $recomputeAlgo = 'fixed';
+                            }
 
                         if ($newSize >= 0) {
                             $actualTempSize = ftell($tempFile);
                             if ($actualTempSize !== $newSize) {
                                 throw new \RuntimeException("Assembled file size mismatch: expected $newSize bytes, actual $actualTempSize bytes");
+                            }
+                        }
+
+                        // The source was read without a lock (see openReadStream()), so
+                        // make sure a concurrent writer did not replace the target while
+                        // we were assembling: if it did, fail the precondition instead of
+                        // swapping in a result assembled from mixed content.
+                        $startEtag = (string)$file->getEtag();
+                        if ($startEtag !== '') {
+                            try {
+                                $currentEtag = (string)$userFolder->get($path)->getEtag();
+                                if ($currentEtag !== $startEtag) {
+                                    throw new EtagMismatchException($path, $startEtag, $currentEtag);
+                                }
+                            } catch (NotFoundException $e) {
+                                // target disappeared while assembling; the rename recreates it
                             }
                         }
 
@@ -380,13 +411,14 @@ class BlockMapService {
                         // underlying storage rename is atomic, so readers observe either the
                         // complete old file or the complete new file. A worker killed at any
                         // point can no longer leave the target truncated.
-                        fseek($tempFile, 0, SEEK_SET);
-                        $this->replaceFileAtomically($userId, $path, $file, $tempFile);
+                        $this->commitAssembly($assembly, $userId, $path, $file, $tempFile);
                     } finally {
                         if (is_resource($tempFile)) {
                             fclose($tempFile);
                         }
-                        @unlink($tempFilePath);
+                        if (is_string($tempFilePath)) {
+                            @unlink($tempFilePath);
+                        }
                     }
 
                     // Re-resolve the node: the atomic replace swapped the content behind
@@ -421,7 +453,7 @@ class BlockMapService {
                     // hash/size/offset is known during assembly). Fall back to a full scan when
                     // no recipe is available or the derived data is inconsistent.
                     $freshMap = null;
-                    if ($recomputeAlgo === 'fastcdc' && is_array($derivedSignatures)) {
+                    if (is_array($derivedSignatures)) {
                         $derivedTotal = 0;
                         foreach ($derivedSignatures as $derivedSig) {
                             $derivedTotal += (int)$derivedSig['size'];
@@ -430,14 +462,18 @@ class BlockMapService {
                             $freshMap = [
                                 'filePath' => $path,
                                 'totalSize' => (int)$finalSize,
-                                'algorithm' => 'fastcdc',
-                                'minSize' => FastCdc::DEFAULT_MIN_SIZE,
-                                'avgSize' => FastCdc::DEFAULT_AVG_SIZE,
-                                'maxSize' => FastCdc::DEFAULT_MAX_SIZE,
+                                'algorithm' => $recomputeAlgo,
                                 'blockCount' => count($derivedSignatures),
                                 'signatures' => $derivedSignatures,
                                 'createdAt' => (new \DateTimeImmutable())->format(\DateTimeInterface::ATOM),
                             ];
+                            if ($recomputeAlgo === 'fastcdc') {
+                                $freshMap['minSize'] = FastCdc::DEFAULT_MIN_SIZE;
+                                $freshMap['avgSize'] = FastCdc::DEFAULT_AVG_SIZE;
+                                $freshMap['maxSize'] = FastCdc::DEFAULT_MAX_SIZE;
+                            } else {
+                                $freshMap['blockSize'] = self::BLOCK_SIZE;
+                            }
                         }
                     }
                     if ($freshMap === null) {
@@ -498,7 +534,7 @@ class BlockMapService {
             }
         }
 
-        $rawSrcStream = $file->fopen('rb');
+        $rawSrcStream = $this->openReadStream($file);
         if ($rawSrcStream === false) {
             throw new \RuntimeException("Cannot open source file for recipe assembly: $path");
         }
@@ -542,7 +578,7 @@ class BlockMapService {
                         throw new \RuntimeException("Staging folder not found for chunk [$hash]");
                     }
                     $stagedNode = $stageFolder->get($hash);
-                    $stagedStream = $stagedNode->fopen('rb');
+                    $stagedStream = $this->openReadStream($stagedNode);
                     if ($stagedStream === false) {
                         throw new \RuntimeException("Cannot open staged chunk stream for [$hash]");
                     }
@@ -615,10 +651,18 @@ class BlockMapService {
     /**
      * Assemble file using legacy offset-based patching (streaming, zero RAM buffering).
      *
+     * Returns the fixed 4 MB block signatures derived from the assembled bytes, so
+     * the caller never has to re-read the freshly committed file. Re-reading it in
+     * the same request is not safe with server-side encryption: the sibling part
+     * file has no cache entry, so the commit's cache update records the encrypted
+     * size for the target and an immediate re-read fails signature verification
+     * ("Bad Signature"). The plaintext assembly copy is read locally instead.
+     *
      * @param resource $tempFile Open temp output stream
+     * @return array<int, array{blockIndex: int, offset: int, size: int, weakHash: int, strongHash: string}>
      */
-    private function assembleWithOffsetBlocks(string $userId, \OCP\Files\File $file, string $path, int $newSize, $tempFile): void {
-        $srcStream = $file->fopen('rb');
+    private function assembleWithOffsetBlocks(string $userId, \OCP\Files\File $file, string $path, int $newSize, $tempFile): array {
+        $srcStream = $this->openReadStream($file);
         if ($srcStream === false) {
             throw new \RuntimeException("Cannot open source file for offset assembly: $path");
         }
@@ -651,7 +695,7 @@ class BlockMapService {
             // Keep the delta lock alive across long assemblies.
             $this->refreshPathLock();
 
-            $stagedStream = $node->fopen('rb');
+            $stagedStream = $this->openReadStream($node);
             if ($stagedStream === false) {
                 throw new \RuntimeException("Cannot open staged block stream for offset $offset of $path");
             }
@@ -666,14 +710,64 @@ class BlockMapService {
             $assembledLength = max($assembledLength, (int)$offset + (int)$node->getSize());
         }
 
-        if ($newSize >= 0 && $assembledLength !== $newSize) {
-            throw new \RuntimeException("Assembled file size mismatch: expected $newSize bytes, actual $assembledLength bytes");
+        // The assembled content must cover the requested size; it is allowed to be
+        // longer when the file is being shrunk, in which case the truncation below
+        // drops the unchanged tail.
+        if ($newSize >= 0 && $assembledLength < $newSize) {
+            throw new \RuntimeException("Assembled file is shorter than the requested size: expected at least $newSize bytes, assembled $assembledLength bytes");
         }
 
         if ($newSize >= 0) {
             ftruncate($tempFile, $newSize);
             fseek($tempFile, $newSize, SEEK_SET);
         }
+
+        return $this->buildFixedSignatures($tempFile, $newSize >= 0 ? $newSize : $assembledLength);
+    }
+
+    /**
+     * Derive fixed 4 MB block signatures from an already assembled (plaintext)
+     * stream, rewinding it first. Used so finalize never has to read back the
+     * committed file inside the same request (see assembleWithOffsetBlocks()).
+     *
+     * @param resource $stream
+     * @return array<int, array{blockIndex: int, offset: int, size: int, weakHash: int, strongHash: string}>
+     */
+    private function buildFixedSignatures($stream, int $size): array {
+        $signatures = [];
+        if ($size <= 0 || !is_resource($stream)) {
+            return $signatures;
+        }
+        if (fseek($stream, 0, SEEK_SET) !== 0) {
+            return $signatures;
+        }
+
+        $blockSize = self::BLOCK_SIZE;
+        $blockCount = (int)ceil($size / $blockSize);
+        for ($i = 0; $i < $blockCount; $i++) {
+            $offset = $i * $blockSize;
+            $remaining = min($blockSize, $size - $offset);
+            $data = '';
+            while (strlen($data) < $remaining) {
+                $chunk = fread($stream, $remaining - strlen($data));
+                if ($chunk === false || $chunk === '') {
+                    break;
+                }
+                $data .= $chunk;
+            }
+            if ($data === '') {
+                break;
+            }
+            $signatures[] = [
+                'blockIndex' => $i,
+                'offset' => $offset,
+                'size' => strlen($data),
+                'weakHash' => $this->adler32($data),
+                'strongHash' => hash('sha256', $data),
+            ];
+        }
+
+        return $signatures;
     }
 
     public function assertEtag(string $userId, string $path, ?string $ifMatch): void {
@@ -1000,6 +1094,109 @@ class BlockMapService {
         }
     }
 
+    /**
+     * Open the output target for the assembled content.
+     *
+     * Preferred: a sibling "<name>.<random hex>.part" file inside the target's own
+     * folder, written through the filesystem View. Compared with a system temp file
+     * this (a) keeps plaintext assembly data out of the shared temp directory, so a
+     * crashed worker cannot leave a plaintext copy of the file behind, (b) saves one
+     * full read+write of the file (assembly -> part -> rename instead of
+     * assembly -> temp -> part -> rename), and (c) makes crash leftovers ordinary
+     * partial files inside the user's storage, which server-side encryption encrypts
+     * and which Nextcloud's scanner/cache (and therefore every client) ignores.
+     *
+     * Falls back to the previous system-temp-file flow when the assembly is not a
+     * plain sequential write (the legacy offset mode seeks and truncates its output)
+     * or when the storage cannot hand out a seekable write stream.
+     *
+     * @param bool $sequential True when the caller only appends to the stream
+     * @return array{view: ?\OC\Files\View, relPath: string, relPart: string, stream: resource, fallbackTempPath: ?string}
+     */
+    private function openAssemblyTarget(string $userId, string $path, \OCP\Files\File $file, bool $sequential): array {
+        // Reclaim abandoned part files before creating a new one.
+        $this->cleanAbandonedPartFiles($file);
+
+        if ($sequential && class_exists('\OC\Files\View')) {
+            $relPart = '';
+            try {
+                $view = new \OC\Files\View('/' . $userId . '/files');
+                $relPath = ltrim($path, '/');
+                $relDir = dirname($relPath);
+                if ($relDir === '.' || $relDir === '/') {
+                    $relDir = '';
+                }
+                $relPart = ($relDir !== '' ? $relDir . '/' : '')
+                    . $file->getName() . '.' . bin2hex(random_bytes(8)) . '.part';
+
+                $stream = $view->fopen($relPart, 'w');
+                if (is_resource($stream)) {
+                    $meta = stream_get_meta_data($stream);
+                    if (!empty($meta['seekable'])) {
+                        return [
+                            'view' => $view,
+                            'relPath' => $relPath,
+                            'relPart' => $relPart,
+                            'stream' => $stream,
+                            'fallbackTempPath' => null,
+                        ];
+                    }
+                    fclose($stream);
+                    try {
+                        $view->unlink($relPart);
+                    } catch (\Throwable $e) {}
+                }
+            } catch (\Throwable $e) {
+                error_log('crispcloud_delta: part-file assembly unavailable for ' . $path . ': ' . $e->getMessage());
+            }
+        }
+
+        // Fallback: system temp file (previous behaviour).
+        $tempFilePath = tempnam(sys_get_temp_dir(), 'nc_delta_');
+        $stream = fopen($tempFilePath, 'w+b');
+        if ($stream === false) {
+            throw new \RuntimeException("Cannot create temp file for finalize");
+        }
+        return [
+            'view' => null,
+            'relPath' => '',
+            'relPart' => '',
+            'stream' => $stream,
+            'fallbackTempPath' => $tempFilePath,
+        ];
+    }
+
+    /**
+     * Commit the assembled content: close the stream and atomically rename the part
+     * file over the target. Falls back to the temp-file flow when the assembly ran
+     * into a system temp file.
+     */
+    private function commitAssembly(array $assembly, string $userId, string $path, \OCP\Files\File $file, $stream): void {
+        if ($assembly['view'] === null) {
+            if (is_resource($stream)) {
+                fseek($stream, 0, SEEK_SET);
+            }
+            $this->replaceFileAtomically($userId, $path, $file, $stream);
+            return;
+        }
+
+        // Close first so buffered data (and encryption trailers) reach the part file
+        // before it becomes the target.
+        if (is_resource($stream)) {
+            fclose($stream);
+        }
+
+        $view = $assembly['view'];
+        $this->dispatchNodeWrittenEvents($file, true);
+        if (!$this->renamePartWithRetry($view, $assembly['relPart'], $assembly['relPath'])) {
+            try {
+                $view->unlink($assembly['relPart']);
+            } catch (\Throwable $e) {}
+            throw new \RuntimeException("Cannot atomically replace $path");
+        }
+        $this->dispatchNodeWrittenEvents($file, false);
+    }
+
     private function replaceFileAtomically(string $userId, string $path, \OCP\Files\File $file, $sourceStream): void {
         if (!class_exists('\OC\Files\View')) {
             // Legacy/unknown platform: keep the previous in-place write rather than
@@ -1030,7 +1227,7 @@ class BlockMapService {
             throw new \RuntimeException("Cannot write part file for $path");
         }
 
-        if (!$view->rename($relPart, $relPath)) {
+        if (!$this->renamePartWithRetry($view, $relPart, $relPath)) {
             try {
                 $view->unlink($relPart);
             } catch (\Throwable $e) {}
@@ -1038,6 +1235,61 @@ class BlockMapService {
         }
 
         $this->dispatchNodeWrittenEvents($file, false);
+    }
+
+    /**
+     * Open a binary read stream without holding a Nextcloud file lock.
+     *
+     * A View read stream keeps a shared lock for as long as it is open (View wraps
+     * the stream and releases the lock from the stream's close callback), so a
+     * worker killed while assembling or scanning a large file leaks that lock for
+     * filelocking.ttl. Worse, Nextcloud extends a shared lock's TTL on every later
+     * acquisition, so a leaked lock is kept alive by the very retries it blocks;
+     * View::rename() then fails forever because upgrading the target lock from
+     * shared to exclusive requires that no other shared holder exists.
+     *
+     * Reading through the storage layer keeps the encryption/quota wrappers but
+     * takes no lock, so an aborted worker cannot block the file. The per-path delta
+     * lock still serialises every delta operation for the same target.
+     *
+     * @param \OCP\Files\Node $node
+     * @return resource|false
+     */
+    private function openReadStream($node) {
+        try {
+            if (method_exists($node, 'getStorage') && method_exists($node, 'getInternalPath')) {
+                $storage = $node->getStorage();
+                $internalPath = $node->getInternalPath();
+                if ($storage !== null && is_string($internalPath) && $internalPath !== '') {
+                    $stream = $storage->fopen($internalPath, 'rb');
+                    if (is_resource($stream)) {
+                        return $stream;
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            // fall back to the regular, locked view stream below
+        }
+        return $node->fopen('rb');
+    }
+
+    /**
+     * Rename the assembled part file over the target, waiting out a temporarily
+     * locked target. The part file is already complete at this point, so a retry
+     * only repeats the rename and never the assembly.
+     */
+    private function renamePartWithRetry($view, string $relPart, string $relPath): bool {
+        for ($attempt = 0; ; $attempt++) {
+            try {
+                return (bool)$view->rename($relPart, $relPath);
+            } catch (\Throwable $e) {
+                $isLocked = stripos($e->getMessage(), 'locked') !== false;
+                if (!$isLocked || $attempt >= self::COMMIT_LOCK_RETRIES) {
+                    throw $e;
+                }
+                usleep(self::COMMIT_LOCK_RETRY_US);
+            }
+        }
     }
 
     private function loadCachedBlockMap(string $userId, string $path, string $algo = 'fixed'): ?array {

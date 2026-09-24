@@ -332,8 +332,8 @@ def test_file_grow(base_url, user, password):
 def test_stale_etag_rejected(base_url, user, password):
     print("\n[6] Stale ETag mutation is rejected")
     remote_path = "_delta_test_stale_etag.bin"
-    original = bytes(b'\\x11' * BLOCK_SIZE)
-    concurrent = bytes(b'\\x22' * BLOCK_SIZE)
+    original = bytes(b'\x11' * BLOCK_SIZE)
+    concurrent = bytes(b'\x22' * BLOCK_SIZE)
 
     try:
         code = webdav_put(base_url, user, password, remote_path, original)
